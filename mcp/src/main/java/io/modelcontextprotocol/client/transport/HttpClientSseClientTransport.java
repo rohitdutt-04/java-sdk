@@ -109,12 +109,6 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	 */
 	private final Sinks.One<String> endpointSink = Sinks.one();
 
-	/** Holds the discovered message endpoint URL */
-	private final AtomicReference<String> messageEndpoint = new AtomicReference<>();
-
-	/** Holds the SSE connection future */
-	private final AtomicReference<CompletableFuture<Void>> connectionFuture = new AtomicReference<>();
-
 	/**
 	 * Creates a new transport instance with default HTTP client and object mapper.
 	 * @param baseUri the base URI of the MCP server
