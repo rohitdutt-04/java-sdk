@@ -95,13 +95,17 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	/** Flag indicating if the transport is in closing state */
 	private volatile boolean isClosing = false;
 
-	/**  Signals the successful completion of the connection setup (used in connect()).
-	 * This sink emits once when the SSE endpoint is received and the client is ready to send messages.
+	/**
+	 * Signals the successful completion of the connection setup (used in connect()). This
+	 * sink emits once when the SSE endpoint is received and the client is ready to send
+	 * messages.
 	 */
 	private final Sinks.One<Void> closeSink = Sinks.one();
 
-	/** Holds the message endpoint received via SSE and signals its availability.
-	 * sendMessage() can subscribe to this to wait reactively instead of blocking with a latch.
+	/**
+	 * Holds the message endpoint received via SSE and signals its availability.
+	 * sendMessage() can subscribe to this to wait reactively instead of blocking with a
+	 * latch.
 	 */
 	private final Sinks.One<String> endpointSink = Sinks.one();
 
@@ -360,7 +364,7 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 						String endpoint = event.data();
 						messageEndpoint.set(endpoint);
 						endpointSink.tryEmitValue(endpoint); // Signal endpoint readiness
-						closeSink.tryEmitEmpty();            // Signal connect() completion
+						closeSink.tryEmitEmpty(); // Signal connect() completion
 					}
 					else if (MESSAGE_EVENT_TYPE.equals(event.type())) {
 						JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, event.data());
@@ -373,7 +377,8 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 				catch (IOException e) {
 					logger.error("Error processing SSE event", e);
 					endpointSink.tryEmitError(e);
-					closeSink.tryEmitError(e);				}
+					closeSink.tryEmitError(e);
+				}
 			}
 
 			@Override
@@ -381,7 +386,8 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 				if (!isClosing) {
 					logger.error("SSE connection error", error);
 					endpointSink.tryEmitError(error);
-					closeSink.tryEmitError(error);				}
+					closeSink.tryEmitError(error);
+				}
 			}
 		});
 
@@ -403,37 +409,33 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 		if (isClosing) {
 			return Mono.empty();
 		}
-	
+
 		return closeSink.asMono()
 			.timeout(Duration.ofSeconds(10))
-			.onErrorResume(TimeoutException.class, e ->
-				Mono.error(new McpError("Failed to wait for the message endpoint"))
-			)
+			.onErrorResume(TimeoutException.class,
+					e -> Mono.error(new McpError("Failed to wait for the message endpoint")))
 			.then(Mono.defer(() -> {
 				String endpoint = messageEndpoint.get();
 				if (endpoint == null) {
 					return Mono.error(new McpError("No message endpoint available"));
 				}
-	
+
 				try {
 					String jsonText = objectMapper.writeValueAsString(message);
 					URI requestUri = Utils.resolveUri(baseUri, endpoint);
 					HttpRequest request = requestBuilder.uri(requestUri)
 						.POST(HttpRequest.BodyPublishers.ofString(jsonText))
 						.build();
-	
-					return Mono.fromFuture(
-						httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
-							.thenAccept(response -> {
-								if (response.statusCode() != 200 &&
-									response.statusCode() != 201 &&
-									response.statusCode() != 202 &&
-									response.statusCode() != 206) {
-									logger.error("Error sending message: {}", response.statusCode());
-								}
-							})
-					);
-				} catch (IOException e) {
+
+					return Mono.fromFuture(httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+						.thenAccept(response -> {
+							if (response.statusCode() != 200 && response.statusCode() != 201
+									&& response.statusCode() != 202 && response.statusCode() != 206) {
+								logger.error("Error sending message: {}", response.statusCode());
+							}
+						}));
+				}
+				catch (IOException e) {
 					if (!isClosing) {
 						return Mono.error(new RuntimeException("Failed to serialize message", e));
 					}
@@ -454,7 +456,7 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	public Mono<Void> closeGracefully() {
 		isClosing = true;
 		closeSink.tryEmitEmpty();
-		return Mono.empty(); 
+		return Mono.empty();
 	}
 
 	/**
