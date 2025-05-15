@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -28,6 +29,7 @@ import io.modelcontextprotocol.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 
 /**
  * Server-Sent Events (SSE) implementation of the
@@ -93,8 +95,15 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	/** Flag indicating if the transport is in closing state */
 	private volatile boolean isClosing = false;
 
-	/** Latch for coordinating endpoint discovery */
-	private final CountDownLatch closeLatch = new CountDownLatch(1);
+	/**  Signals the successful completion of the connection setup (used in connect()).
+	 * This sink emits once when the SSE endpoint is received and the client is ready to send messages.
+	 */
+	private final Sinks.One<Void> closeSink = Sinks.one();
+
+	/** Holds the message endpoint received via SSE and signals its availability.
+	 * sendMessage() can subscribe to this to wait reactively instead of blocking with a latch.
+	 */
+	private final Sinks.One<String> endpointSink = Sinks.one();
 
 	/** Holds the discovered message endpoint URL */
 	private final AtomicReference<String> messageEndpoint = new AtomicReference<>();
@@ -338,9 +347,6 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	 */
 	@Override
 	public Mono<Void> connect(Function<Mono<JSONRPCMessage>, Mono<JSONRPCMessage>> handler) {
-		CompletableFuture<Void> future = new CompletableFuture<>();
-		connectionFuture.set(future);
-
 		URI clientUri = Utils.resolveUri(this.baseUri, this.sseEndpoint);
 		sseClient.subscribe(clientUri.toString(), new FlowSseClient.SseEventHandler() {
 			@Override
@@ -353,8 +359,8 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 					if (ENDPOINT_EVENT_TYPE.equals(event.type())) {
 						String endpoint = event.data();
 						messageEndpoint.set(endpoint);
-						closeLatch.countDown();
-						future.complete(null);
+						endpointSink.tryEmitValue(endpoint); // Signal endpoint readiness
+						closeSink.tryEmitEmpty();            // Signal connect() completion
 					}
 					else if (MESSAGE_EVENT_TYPE.equals(event.type())) {
 						JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, event.data());
@@ -366,20 +372,20 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 				}
 				catch (IOException e) {
 					logger.error("Error processing SSE event", e);
-					future.completeExceptionally(e);
-				}
+					endpointSink.tryEmitError(e);
+					closeSink.tryEmitError(e);				}
 			}
 
 			@Override
 			public void onError(Throwable error) {
 				if (!isClosing) {
 					logger.error("SSE connection error", error);
-					future.completeExceptionally(error);
-				}
+					endpointSink.tryEmitError(error);
+					closeSink.tryEmitError(error);				}
 			}
 		});
 
-		return Mono.fromFuture(future);
+		return closeSink.asMono();
 	}
 
 	/**
@@ -397,43 +403,43 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 		if (isClosing) {
 			return Mono.empty();
 		}
-
-		try {
-			if (!closeLatch.await(10, TimeUnit.SECONDS)) {
-				return Mono.error(new McpError("Failed to wait for the message endpoint"));
-			}
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt(); // Preserve interrupt status
-			return Mono.error(new McpError("Failed to wait for the message endpoint"));
-		}
-
-		String endpoint = messageEndpoint.get();
-		if (endpoint == null) {
-			return Mono.error(new McpError("No message endpoint available"));
-		}
-
-		try {
-			String jsonText = this.objectMapper.writeValueAsString(message);
-			URI requestUri = Utils.resolveUri(baseUri, endpoint);
-			HttpRequest request = this.requestBuilder.uri(requestUri)
-				.POST(HttpRequest.BodyPublishers.ofString(jsonText))
-				.build();
-
-			return Mono.fromFuture(
-					httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding()).thenAccept(response -> {
-						if (response.statusCode() != 200 && response.statusCode() != 201 && response.statusCode() != 202
-								&& response.statusCode() != 206) {
-							logger.error("Error sending message: {}", response.statusCode());
-						}
-					}));
-		}
-		catch (IOException e) {
-			if (!isClosing) {
-				return Mono.error(new RuntimeException("Failed to serialize message", e));
-			}
-			return Mono.empty();
-		}
+	
+		return closeSink.asMono()
+			.timeout(Duration.ofSeconds(10))
+			.onErrorResume(TimeoutException.class, e ->
+				Mono.error(new McpError("Failed to wait for the message endpoint"))
+			)
+			.then(Mono.defer(() -> {
+				String endpoint = messageEndpoint.get();
+				if (endpoint == null) {
+					return Mono.error(new McpError("No message endpoint available"));
+				}
+	
+				try {
+					String jsonText = objectMapper.writeValueAsString(message);
+					URI requestUri = Utils.resolveUri(baseUri, endpoint);
+					HttpRequest request = requestBuilder.uri(requestUri)
+						.POST(HttpRequest.BodyPublishers.ofString(jsonText))
+						.build();
+	
+					return Mono.fromFuture(
+						httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+							.thenAccept(response -> {
+								if (response.statusCode() != 200 &&
+									response.statusCode() != 201 &&
+									response.statusCode() != 202 &&
+									response.statusCode() != 206) {
+									logger.error("Error sending message: {}", response.statusCode());
+								}
+							})
+					);
+				} catch (IOException e) {
+					if (!isClosing) {
+						return Mono.error(new RuntimeException("Failed to serialize message", e));
+					}
+					return Mono.empty();
+				}
+			}));
 	}
 
 	/**
@@ -446,13 +452,9 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	 */
 	@Override
 	public Mono<Void> closeGracefully() {
-		return Mono.fromRunnable(() -> {
-			isClosing = true;
-			CompletableFuture<Void> future = connectionFuture.get();
-			if (future != null && !future.isDone()) {
-				future.cancel(true);
-			}
-		});
+		isClosing = true;
+		closeSink.tryEmitEmpty();
+		return Mono.empty(); 
 	}
 
 	/**
