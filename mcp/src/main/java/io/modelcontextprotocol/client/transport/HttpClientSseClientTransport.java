@@ -362,7 +362,6 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 				try {
 					if (ENDPOINT_EVENT_TYPE.equals(event.type())) {
 						String endpoint = event.data();
-						messageEndpoint.set(endpoint);
 						endpointSink.tryEmitValue(endpoint); // Signal endpoint readiness
 						closeSink.tryEmitEmpty(); // Signal connect() completion
 					}
@@ -409,39 +408,42 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 		if (isClosing) {
 			return Mono.empty();
 		}
-
-		return closeSink.asMono()
+	
+		return endpointSink.asMono()
 			.timeout(Duration.ofSeconds(10))
-			.onErrorResume(TimeoutException.class,
-					e -> Mono.error(new McpError("Failed to wait for the message endpoint")))
-			.then(Mono.defer(() -> {
-				String endpoint = messageEndpoint.get();
+			.onErrorResume(TimeoutException.class, e ->
+				Mono.error(new McpError("Failed to wait for the message endpoint")))
+			.flatMap(endpoint -> {
 				if (endpoint == null) {
 					return Mono.error(new McpError("No message endpoint available"));
 				}
-
+	
 				try {
 					String jsonText = objectMapper.writeValueAsString(message);
 					URI requestUri = Utils.resolveUri(baseUri, endpoint);
 					HttpRequest request = requestBuilder.uri(requestUri)
 						.POST(HttpRequest.BodyPublishers.ofString(jsonText))
 						.build();
-
-					return Mono.fromFuture(httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
-						.thenAccept(response -> {
-							if (response.statusCode() != 200 && response.statusCode() != 201
-									&& response.statusCode() != 202 && response.statusCode() != 206) {
-								logger.error("Error sending message: {}", response.statusCode());
-							}
-						}));
-				}
-				catch (IOException e) {
+	
+					return Mono.fromFuture(
+						httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+							.thenAccept(response -> {
+								if (response.statusCode() != 200 &&
+									response.statusCode() != 201 &&
+									response.statusCode() != 202 &&
+									response.statusCode() != 206) {
+									logger.error("Error sending message: {}", response.statusCode());
+								}
+							})
+					);
+				} catch (IOException e) {
+					logger.error("Failed to serialize message", e);
 					if (!isClosing) {
 						return Mono.error(new RuntimeException("Failed to serialize message", e));
 					}
 					return Mono.empty();
 				}
-			}));
+			});
 	}
 
 	/**
